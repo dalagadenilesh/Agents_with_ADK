@@ -43,32 +43,30 @@ def greeting_tool(name: str):
 
     return f"Hello {name}, Nice to meet you."
 
-
-
 @mcp_server.tool
 def get_sql_table_schema():
-    '''This is used to get schema of all tables present in database
-    
-    Args:
-
-    Returns:
-        schema - Sql schema of all tables in database. 
-    '''
+    '''Get get schema of all tables present in database'''
     inspector = sqlalchemy.inspect(engine)
-    table_names = inspector.get_table_names()
-    metadata = MetaData()
+    
+    context = ""
+    for table_name in inspector.get_table_names():
+        context += f"""TABLE: {table_name}\n\tColumns"""
+        columns = inspector.get_columns(table_name)
 
-    schema = ''
-    for table in table_names:
-        users_table = Table(
-                table, 
-                metadata, 
-                autoload_with = engine
-        )
+        for c in columns:
+            comment = f"Column of Table {table_name} which is of type {c['type']}"
 
-        schema += str(CreateTable(users_table).compile(dialect = sqlite.dialect()))
-        schema += '\n'
-    return schema
+            if c['comment']:
+                comment = c['comment'] + comment
+
+            context += f"""\n\t\t- {c['name']}\n\t\t\tType : {c['type']}\n\t\t\tdefault: {c['default']}\n\t\t\tcomment:  {comment}\n\t\t\tnullable: {c['nullable']}\n\n\t\t"""
+          
+        context += f"""\n\tPrimary-key:"""
+        for key, value in inspector.get_pk_constraint(table_name).items():
+            context += f"""{key}: {value}"""
+        context += f"""\n\tforeign-keys: {inspector.get_foreign_keys(table_name)}\n\n\n"""
+ 
+    return context
 
 @mcp_server.tool
 def validate_query(query: str) -> str:

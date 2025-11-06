@@ -13,13 +13,20 @@ from decimal import Decimal
 from google.adk.tools.tool_context import ToolContext
 from google.adk.agents.callback_context import CallbackContext
 from typing import Optional
-from google.genai import types
+import google.genai.types as types
+from google.adk.sessions import InMemorySessionService
+from google.adk.artifacts import InMemoryArtifactService
 import warnings
+import asyncio
+from google.adk.runners import Runner
 
 warnings.filterwarnings("ignore", category=UserWarning, module=".*google\\.adk.*")
 
 TARGET_FOLDER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "./agetfolder")
 os.makedirs(TARGET_FOLDER_PATH, exist_ok=True) 
+
+session_service = InMemorySessionService()
+artifact_service = InMemoryArtifactService()
 
 
 user = os.environ.get('username')
@@ -58,6 +65,48 @@ fileserver_mcp_tool = McpToolset(
         )
 
 
+async def save_master_data_tool(text:str, tool_context: ToolContext):
+    """
+    Tool to Save Database table Schema content in artifact
+
+    Args:
+        text - Database table schema
+    
+    Returns:
+        None
+    """
+    filename = 'schema.txt'
+
+    
+    report_artifact = types.Part.from_bytes(
+    data = text.encode("utf-8"),
+    mime_type = "application/json")
+
+    version = await tool_context.save_artifact(
+        filename = filename,
+        artifact = report_artifact
+    )
+    tool_context.state['table_schema_filename'] = filename
+
+
+async def load_master_data_tool(tool_context: ToolContext):
+    
+    """Loads the complete, raw content of the database schema from artifact. 
+    
+    Returns:
+        database schema content
+    """
+    
+    filename = tool_context.state.get('table_schema_filename')
+    report_artifact = await tool_context.load_artifact(filename = filename)
+
+    if report_artifact.inline_data and report_artifact.inline_data.data:
+        text = report_artifact.inline_data.data.decode("utf-8")
+    
+        return text
+
+
+
 def exit_loop(tool_context: ToolContext):
   """Call this function ONLY when the No Error in generated sql query, signaling the iterative process should end."""
   tool_context.actions.escalate = True
@@ -73,7 +122,8 @@ def get_sql_table_schema_wrapper(text: str, tool_context: ToolContext):
     tool_context.state['table_schema'] = text
 
 get_sql_table_schema_wrapper_tool = FunctionTool(get_sql_table_schema_wrapper)
-
+load_schema_table_tool = FunctionTool(load_master_data_tool)
+save_schema_table_tool = FunctionTool(save_master_data_tool)
 
 query_generator = Agent(
     name = 'sql_query_generator',
@@ -81,21 +131,20 @@ query_generator = Agent(
     description = 'You are an expert SQL query generator. Your sole function is to translate user requests into accurate, optimized SQL queries. Only output the SQL query itself, unless the user explicitly asks for an explanation.',
     instruction = """
     Your Job is to Generate an accurate SQL Query from the user statement, {{NL_Query}}, using the available Database Table Schema.
+    
+    ** Workflow **
 
-    **Workflow Stages:**
+    1.  Check the state variable ** {{table_schema_filename}} **.
+    2.  If ** {{table_schema_filename}} ** is exactly "No Schema File":
+        - Call `get_sql_table_schema` to retrieve the database table schema.
+        - Then, immediately call `save_schema_table_tool` to save that schema as an artifact.
+    
+    3.  Invoke `load_schema_table_tool` and the user statement ** {{NL_Query}} ** to generate the SQL query.
+    4.  **Constraint:** Do not assume any tables or columns. Use only the objects explicitly available in the schema.
+    5.  **Self-Correction:** After generation, perform a syntax and logic error analysis on the query. Correct any issues, ensuring column names are **not** quoted.
 
-    **Stage 1: Retrieve and Save Schema**
-    1.  Check the state variable **{{table_schema}}**.
-    2.  If **{{table_schema}}** is **exactly** "No table Schema", you **must** call the **`get_sql_table_schema`** tool to get the raw schema data.
-    3.  Immediately after, you **must** call the **`get_sql_table_schema_wrapper_tool`** tool, passing the raw schema output from the previous step as the `text` argument.
-
-    **Stage 2: Generate and Correct SQL**
-    1.  Use the table schema (now available via **{{table_schema}}**) and the user statement {{NL_Query}} to generate the SQL query.
-    2.  **Constraint:** Do not assume any tables or columns. Use only the objects explicitly available in the schema.
-    3.  **Self-Correction:** After generation, perform a syntax and logic error analysis on the query. Correct any issues, ensuring column names are **not** quoted.
-
-    **Final Output Requirement:**
-    * Output **only** the final, correct SQL query text. Do not add introductions or explanations.
+    ** Agent Output Requirement **
+    * You must output Generated SQL query. Do not add introductions or explanations.
     """,
     output_key = 'SQL_Query',
     tools = [
@@ -131,7 +180,7 @@ query_modifier_agent = Agent(
 
     **Available Context:**
     * **User Statement:** {{NL_Query}}
-    * **Ground Truth Schema:** {{table_schema}}
+    * **Ground Truth Schema:** Invoke `load_schema_table_tool` tool.
     * **Prior SQL Query:** {{SQL_Query}}
     * **Query Validation Feedback:** {{Query_validations}}
     
@@ -177,7 +226,9 @@ def check_initial_intent(callback_context: CallbackContext, **kwargs):
 
 nl2sql_agent = SequentialAgent(
     name = 'nl_to_sql',
-    description = 'You are important assistant agent which genrate SQL query from user statement.',
+    description = """A multi-step agent designed for robust SQL query generation. It first creates a raw SQL query from natural language and then
+    passes that query to an internal modifier sub-agent for validation, optimization, and correction before final execution or display.
+    Use for complex or potentially ambiguous data requests."""
     sub_agents = [query_generator, sql_modifier],
     before_agent_callback = check_initial_intent
 )
@@ -186,13 +237,17 @@ nl2sql_agent = SequentialAgent(
 data_extraction = Agent(
     name = 'data_extractor',
     model = "gemini-2.5-pro",
-    description = "You are helpful assitant to extract data from database.",
+    description = """
+    This agent's primary function is to run the existing SQL query (e.g., SELECT, INSERT, UPDATE) against the database, retrieve the resulting data,
+    and then perform any necessary post-processing or saving operations (e.g., saving to a file, returning the final result to the user).
+    Do not call this agent for query generation or correction; call it only for execution.""",
+    
     instruction = """You are an Experxt Sql Developer. Your Job is to Extract data from database using {{SQL_Query}} query.
     Use get_sql_data tool to fetch data from database.
     """,
     output_key = 'SQL_DATA',
     tools = [
-        toolset
+        toolset, fileserver_mcp_tool
     ]
 )
 
@@ -217,4 +272,12 @@ root_agent = LlmAgent(
    
    sub_agents = [nl2sql_agent, data_extraction],
    before_agent_callback = session_init
+)
+
+
+runner = Runner(
+    agent = root_agent,
+    app_name = "DaT-a-NaLySt",
+    session_service = session_service,
+    artifact_service = artifact_service # Provide the service instance here
 )

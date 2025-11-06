@@ -8,7 +8,7 @@ from typing import List, Dict
 from typing import List, Dict
 from decimal import Decimal
 import os
-
+import json
 
 mcp_server = FastMCP()
 connector = Connector()
@@ -46,27 +46,19 @@ def greeting_tool(name: str):
 @mcp_server.tool
 def get_sql_table_schema():
     '''Get get schema of all tables present in database'''
-    inspector = sqlalchemy.inspect(engine)
+    metadata = MetaData()
+    metadata.reflect(bind = engine)
     
-    context = ""
-    for table_name in inspector.get_table_names():
-        context += f"""TABLE: {table_name}\n\tColumns"""
-        columns = inspector.get_columns(table_name)
+    table_schema = []
 
-        for c in columns:
-            comment = f"Column of Table {table_name} which is of type {c['type']}"
-
-            if c['comment']:
-                comment = c['comment'] + comment
-
-            context += f"""\n\t\t- {c['name']}\n\t\t\tType : {c['type']}\n\t\t\tdefault: {c['default']}\n\t\t\tcomment:  {comment}\n\t\t\tnullable: {c['nullable']}\n\n\t\t"""
-          
-        context += f"""\n\tPrimary-key:"""
-        for key, value in inspector.get_pk_constraint(table_name).items():
-            context += f"""{key}: {value}"""
-        context += f"""\n\tforeign-keys: {inspector.get_foreign_keys(table_name)}\n\n\n"""
- 
-    return context
+    for table_name, table_obj in metadata.tables.items():
+        table = {}
+        ddl_statement = str(CreateTable(table_obj).compile(engine))
+        table['Table_Name'] = table_name
+        table['SQL DDL SCHEMA'] = ddl_statement
+       
+        table_schema.append(table)
+    return json.dumps(table_schema, indent=2)
 
 @mcp_server.tool
 def validate_query(query: str) -> str:

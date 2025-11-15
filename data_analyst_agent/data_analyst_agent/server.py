@@ -9,6 +9,7 @@ from typing import List, Dict
 from decimal import Decimal
 import os
 import json
+from toon import encode, decode
 
 mcp_server = FastMCP()
 connector = Connector()
@@ -46,19 +47,28 @@ def greeting_tool(name: str):
 @mcp_server.tool
 def get_sql_table_schema():
     '''Get get schema of all tables present in database'''
-    metadata = MetaData()
-    metadata.reflect(bind = engine)
-    
-    table_schema = []
+    table_scahema = {}
 
-    for table_name, table_obj in metadata.tables.items():
-        table = {}
-        ddl_statement = str(CreateTable(table_obj).compile(engine))
-        table['Table_Name'] = table_name
-        table['SQL DDL SCHEMA'] = ddl_statement
-       
-        table_schema.append(table)
-    return json.dumps(table_schema, indent=2)
+    inspector = sqlalchemy.inspect(engine)
+    for table_name in inspector.get_table_names():
+        columns = inspector.get_columns(table_name)
+        
+        column_dict = []
+        
+        for c in columns:
+            column_dict.append({'name': c['name'],
+                                    'type': c['type'],
+                                    'default': c['default'],
+                                    'nullable': c['nullable']})
+        pk = inspector.get_pk_constraint(table_name)
+        fk = inspector.get_foreign_keys(table_name)  
+        
+        table_scahema[table_name] = {
+            'table name': table_name,
+            "columns": column_dict,
+            "primary_key": pk,
+            "foreign_keys": fk}
+    return encode(table_scahema, {"delimiter": "\t", "strict": True, "lengthMarker": "#"})
 
 @mcp_server.tool
 def validate_query(query: str) -> str:

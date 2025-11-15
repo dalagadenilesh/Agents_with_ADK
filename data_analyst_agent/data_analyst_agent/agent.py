@@ -19,6 +19,7 @@ from google.adk.artifacts import InMemoryArtifactService
 import warnings
 import asyncio
 from google.adk.runners import Runner
+from toon import encode, decode
 
 warnings.filterwarnings("ignore", category=UserWarning, module=".*google\\.adk.*")
 
@@ -88,22 +89,44 @@ async def save_master_data_tool(text:str, tool_context: ToolContext):
     )
     tool_context.state['table_schema_filename'] = filename
 
+    return {'status': "success", 'message': f'table scahema saved to {filename}'}
 
-async def load_master_data_tool(tool_context: ToolContext):
-    
-    """Loads the complete, raw content of the database schema from artifact. 
-    
+
+async def load_master_data_tool(tool_context: ToolContext, table_names: List[str] = None):
+
+    """Loads the complete, raw content of the database schema from artifact.
+
+    Args:
+        table_names (List[str], default None): table name to get table scahma
+
     Returns:
-        database schema content
+        str: Full database schema content
     """
-    
+    spec = {"delimiter": "\t", "strict": True, "lengthMarker": "#"}
     filename = tool_context.state.get('table_schema_filename')
     report_artifact = await tool_context.load_artifact(filename = filename)
 
     if report_artifact.inline_data and report_artifact.inline_data.data:
         text = report_artifact.inline_data.data.decode("utf-8")
     
+    if not table_names:
         return text
+    
+    if isinstance(table_names, List) and len(table_names) > 0:
+        try:
+            json_data = decode(text, spec)
+            
+            schema = {}
+            for table in table_names:
+                schema[table] = json_data.get(table)
+            
+            return encode(schema, spec)
+        
+        except:
+            pass
+    
+    return text
+
 
 
 
@@ -139,7 +162,7 @@ query_generator = Agent(
         - Call `get_sql_table_schema` to retrieve the database table schema.
         - Then, immediately call `save_schema_table_tool` to save that schema as an artifact.
     
-    3.  Invoke `load_schema_table_tool` and the user statement ** {{NL_Query}} ** to generate the SQL query.
+    3.  Invoke `load_schema_table_tool` without table_names and the user statement ** {{NL_Query}} ** to generate the SQL query.
     4.  **Constraint:** Do not assume any tables or columns. Use only the objects explicitly available in the schema.
     5.  **Self-Correction:** After generation, perform a syntax and logic error analysis on the query. Correct any issues, ensuring column names are **not** quoted.
 
@@ -180,7 +203,7 @@ query_modifier_agent = Agent(
 
     **Available Context:**
     * **User Statement:** {{NL_Query}}
-    * **Ground Truth Schema:** Invoke `load_schema_table_tool` tool.
+    * **Ground Truth Schema:** Invoke `load_schema_table_tool` tool with required table_names.
     * **Prior SQL Query:** {{SQL_Query}}
     * **Query Validation Feedback:** {{Query_validations}}
     

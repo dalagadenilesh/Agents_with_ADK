@@ -102,14 +102,14 @@ def get_sql_data(query: str) -> str:
         query: The complete SQL query string to execute.
     
     Returns:
-        json data
+        Data information, stats and uniqueness of each column as output
     """
     from decimal import Decimal
     import json
-
+    global df
+    global result
     query_text = query.split('\n', 1)[-1].strip()
 
-    # 2. Execute the query
     with engine.connect() as conn:
         sql_result = conn.execute(sqlalchemy.text(query_text)).mappings().all()
 
@@ -117,16 +117,45 @@ def get_sql_data(query: str) -> str:
     for row in sql_result:
         processed_row = {}
         for k, v in row.items():
-            # Convert Decimal to float for generic numeric handling
             if isinstance(v, Decimal):
                 processed_row[k] = float(v)
             else:
                 processed_row[k] = v
         final_result.append(processed_row)
+    df = pd.read_json(json.dumps(final_result))
     
-        # Return the List[Dict] as specified in the function signature
-    return json.dumps(final_result, indent = 2)
+    result = (df.count().to_frame("non_null").assign(dtype = df.dtypes.astype(str)).reset_index().rename(columns = {"index": "column"}).to_dict(orient = "records"))
+    result = {'info': result, 'description': df.describe().unstack(-1).unstack(0).to_dict(), 'uniquness': df.nunique(dropna = False).to_dict()}
+    
+    return encode(result, options = {"delimiter": "\t", "strict": True, "lengthMarker": "#"})
 
+@mcp_server.tool
+def execute_graph(graph_code : str)-> str:
+    """Generates plotly graph from python plotly code.
+    Args:
+        graph_code : Python code for Graph Generation.
+    Returns:
+        base64 enocded plotly graph.
+    """
+    global df, result
+    import gzip
+    import io
+    import traceback
+    import base64
+
+    graph_code = graph_code.strip()
+    
+    namespace = {'df': df}
+
+    try:
+        exec(graph_code, namespace)
+    except Exception as e:
+        return f"Error:" + traceback.format_exc()
+    
+    if "fig" not in namespace:
+        return "fig not found in namespace"
+    
+    return base64.b64encode(gzip.compress(namespace['fig'].to_json().encode())).decode()
 
 if __name__=='__main__':
     mcp_server.run(transport = 'stdio')

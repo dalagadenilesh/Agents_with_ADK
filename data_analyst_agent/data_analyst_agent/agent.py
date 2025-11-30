@@ -20,6 +20,10 @@ import warnings
 import asyncio
 from google.adk.runners import Runner
 from toon import encode, decode
+import gzip
+import plotly.io as pio
+from google.adk.runners import Runner
+import base64
 
 warnings.filterwarnings("ignore", category=UserWarning, module=".*google\\.adk.*")
 
@@ -66,31 +70,39 @@ fileserver_mcp_tool = McpToolset(
         )
 
 
-async def save_master_data_tool(text:str, tool_context: ToolContext):
+async def save_master_data_tool(data: str, tool_context: ToolContext, format: str = 'text'):
     """
     Tool to Save Database table Schema content in artifact
 
     Args:
-        text - Database table schema
-    
+        data - Database table schema
+        format - [text, image, json]
     Returns:
         None
     """
-    filename = 'schema.txt'
-
     
-    report_artifact = types.Part.from_bytes(
-    data = text.encode("utf-8"),
-    mime_type = "application/json")
+
+    if format == 'text':
+        filename = 'schema.txt'
+        report_artifact = types.Part.from_bytes(data = data.encode("utf-8"), mime_type = "application/json")
+    
+    else:
+        filename = 'plot.png'
+        data = base64.b64decode(data)
+        report_artifact = types.Part.from_bytes(data = pio.from_json(gzip.decompress(data).decode()).to_image(format = 'png', width = 400, height = 300), 
+                                                mime_type = "image/png")
 
     version = await tool_context.save_artifact(
         filename = filename,
         artifact = report_artifact
     )
-    tool_context.state['table_schema_filename'] = filename
 
-    return {'status': "success", 'message': f'table scahema saved to {filename}'}
+    if filename.endswith('.txt'):
+        tool_context.state['table_schema_filename'] = filename
+    else:
+        tool_context.state['plotly_graph_file'] = filename
 
+    return
 
 async def load_master_data_tool(tool_context: ToolContext, table_names: List[str] = None):
 
@@ -155,19 +167,23 @@ query_generator = Agent(
     instruction = """
     Your Job is to Generate an accurate SQL Query from the user statement, {{NL_Query}}, using the available Database Table Schema.
     
+
+    **Available Context:**
+    * **User_Statement:** {{NL_Query}}
+    * **Table_Schema:** {{table_schema_filename}}
+
     ** Workflow **
 
-    1.  Check the state variable ** {{table_schema_filename}} **.
-    2.  If ** {{table_schema_filename}} ** is exactly "No Schema File":
+    1.  Check the state variable **Table_Schema**.
+    2.  If **Table_Schema** is exactly "No Schema File":
         - Call `get_sql_table_schema` to retrieve the database table schema.
         - Then, immediately call `save_schema_table_tool` to save that schema as an artifact.
     
-    3.  Invoke `load_schema_table_tool` without table_names and the user statement ** {{NL_Query}} ** to generate the SQL query.
+    3.  Invoke `load_schema_table_tool` without table_names and the user statement **User_Statement** to generate the SQL query.
     4.  **Constraint:** Do not assume any tables or columns. Use only the objects explicitly available in the schema.
     5.  **Self-Correction:** After generation, perform a syntax and logic error analysis on the query. Correct any issues, ensuring column names are **not** quoted.
 
-    ** Agent Output Requirement **
-    * You must output Generated SQL query. Do not add introductions or explanations.
+    Output Generated Sql query only
     """,
     output_key = 'SQL_Query',
     tools = [
@@ -223,6 +239,7 @@ query_modifier_agent = Agent(
     * If you believe the Refined SQL Query is correct and addresses the validation feedback, **output only the Refined SQL Query text.**
     * Do not include any explanations, introductions, or conversational text.
     
+    Output Corrected/refined SQL_Query.
 """,
    output_key = 'SQL_Query',
    tools = [toolset,
@@ -257,21 +274,44 @@ nl2sql_agent = SequentialAgent(
 )
 
 
-data_extraction = Agent(
-    name = 'data_extractor',
-    model = "gemini-2.5-pro",
-    description = """
-    This agent's primary function is to run the existing SQL query (e.g., SELECT, INSERT, UPDATE) against the database, retrieve the resulting data,
-    and then perform any necessary post-processing or saving operations (e.g., saving to a file, returning the final result to the user).
-    Do not call this agent for query generation or correction; call it only for execution.""",
-    
-    instruction = """You are an Experxt Sql Developer. Your Job is to Extract data from database using {{SQL_Query}} query.
-    Use get_sql_data tool to fetch data from database.
+data_agent = LlmAgent(
+    name = 'data_extractor_visualization_agent',
+    model = 'gemini-2.5-pro',
+    description = 'This Agent is specialized to extract data and generate complex plotly graphs in python.',
+    instruction = """
+        Invoke 'get_sql_data' tool to get data from sql_query {{'SQL_Query'}}.
+
+        Analyse metadata, info, column names, column types, statistics and uniquness of data and generate 
+        appropriate plotly graph code in python.
+        
+        Type of plotly graph depends on analysis of data based on meta information provided.
+
+        Assumption:
+            Assume Data in the form of Pandas dataframe as per metadata information and column types.
+            Assume Dataframe name is 'df' only.
+        Constraints:
+            Never create graphs using any other library except plotly.
+            Do not add fig.show() for graph generation.
+            Do not add any explanations or descriptions.
+            
+        
+        Example of Valid plotly graph code:
+        '''import pandas as pd
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+
+        for zoo in ["SF Zoo", "LA Zoo"]:
+            fig.add_trace(go.Bar(name=zoon, x=df["animals"], y=df[zoo]))
+
+        fig.update_layout(barmode = "stack")'''
+
+        Invoke `execute_graph` tool to generate plotly graph with generated plotly code as input.
+        Save generated plotly graph using `save_schema_table_tool` with data as output from `execute_graph` and format as 'image'.
+        exit.
     """,
-    output_key = 'SQL_DATA',
-    tools = [
-        toolset, fileserver_mcp_tool
-    ]
+    tools = [toolset, save_schema_table_tool, exit_loop]
+
 )
 
 def session_init(callback_context: CallbackContext, **kwargs): 
@@ -286,14 +326,14 @@ root_agent = LlmAgent(
     You are the primary router agent. Your sole function is to analyze the user's request, {{invocation_message}}, and determine the appropriate specialized agent to handle the task.
 
     1.  **If the user is asking for the generation of a database query, SQL analysis, or a new report template,** you must delegate the task to the **'nl2sql_agent'** agent.
-    2.  **If the user is asking for data retrieval, to execute a query, or explicitly asking to save, export, or download data,** you must delegate the task to the **'data_extraction'** agent.
+    2.  **If the user is asking for data retrieval, to execute a query, or explicitly asking to save, export, or download data,** you must delegate the task to the **data_agent** agent.
     3.  **If the request is a general greeting, conversation, or irrelevant to SQL/data,** do not delegate or call any tools. You will handle the conversational response.
 
     Your output must be clear and direct, either a conversational response or a structured call to the delegation tool.
   
    """,
    
-   sub_agents = [nl2sql_agent, data_extraction],
+   sub_agents = [nl2sql_agent, data_agent],
    before_agent_callback = session_init
 )
 
